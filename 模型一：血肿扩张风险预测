@@ -1,0 +1,456 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import RFECV
+from sklearn.metrics import roc_auc_score, roc_curve, auc
+import warnings
+from datetime import datetime
+
+# 设置中文字体（避免乱码）
+plt.rcParams['font.sans-serif'] = ['SimHei']  # 或 ['Microsoft YaHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+warnings.filterwarnings('ignore')
+
+# 尝试导入XGBoost和LightGBM
+try:
+    from xgboost import XGBClassifier, callback as xgb_callback
+    xgb_available = True
+except ImportError:
+    xgb_available = False
+    print("警告: XGBoost未安装，将跳过该模型。")
+
+try:
+    import lightgbm as lgb
+    lgb_available = True
+except ImportError:
+    lgb_available = False
+    print("警告: LightGBM未安装，将跳过该模型。")
+
+# ==================== 设置工作目录 ====================
+desktop_path = r'C:\Users\28337\Desktop'
+os.chdir(desktop_path)
+print("当前工作目录：", os.getcwd())
+
+# ==================== 1. 读取数据 ====================
+print("读取数据...")
+df_clinical = pd.read_excel('表1-患者列表及临床信息.xlsx', sheet_name='患者信息', index_col=0)
+df_clinical.reset_index(inplace=True)
+df_clinical.rename(columns={'index': 'ID'}, inplace=True)
+
+df_volume = pd.read_excel('表2-患者影像信息血肿及水肿的体积及位置.xlsx', sheet_name='Data')
+df_hemo_shape = pd.read_excel('表3-患者影像信息血肿及水肿的形状及灰度分布.xlsx', sheet_name='Hemo')
+df_ed_shape = pd.read_excel('表3-患者影像信息血肿及水肿的形状及灰度分布.xlsx', sheet_name='ED')
+
+# 读取附表1（流水号与时间映射）
+try:
+    df_time = pd.read_excel('附表1-检索表格-流水号vs时间.xlsx')
+    time_dict = {}
+    for idx, row in df_time.iterrows():
+        first_serial = row.get('入院首次检查流水号')
+        first_time = row.get('入院首次检查时间点')
+        if pd.notna(first_serial) and pd.notna(first_time):
+            time_dict[first_serial] = pd.to_datetime(first_time)
+        for i in range(1, 14):
+            serial_col = f'随访{i}流水号'
+            time_col = f'随访{i}时间点'
+            if serial_col in df_time.columns and time_col in df_time.columns:
+                serial = row.get(serial_col)
+                t = row.get(time_col)
+                if pd.notna(serial) and pd.notna(t):
+                    time_dict[serial] = pd.to_datetime(t)
+    print("附表1加载成功，共 {} 条流水号记录".format(len(time_dict)))
+except FileNotFoundError:
+    raise FileNotFoundError("未找到附表1文件。")
+
+# ==================== 2. 数据预处理 ====================
+# 临床信息处理
+df_clinical['收缩压'] = df_clinical['血压'].str.split('/').str[0].astype(float)
+df_clinical['舒张压'] = df_clinical['血压'].str.split('/').str[1].astype(float)
+df_clinical.drop('血压', axis=1, inplace=True)
+df_clinical['性别'] = df_clinical['性别'].map({'男': 1, '女': 0})
+df_clinical = df_clinical.drop(['数据集划分', '90天mRS'], axis=1)
+
+# 首次影像信息提取（表2）
+first_cols_vol = ['HM_volume'] + [c for c in df_volume.columns if 'HM_' in c and '随访' not in c and c != 'HM_volume'] + \
+                 ['ED_volume'] + [c for c in df_volume.columns if 'ED_' in c and '随访' not in c and c != 'ED_volume']
+first_cols_vol = list(dict.fromkeys(first_cols_vol))
+df_first_vol = df_volume[['ID'] + first_cols_vol].copy()
+
+# 表3形状灰度特征
+hemo_feat_cols = [c for c in df_hemo_shape.columns if c not in ['备注', '流水号']]
+ed_feat_cols = [c for c in df_ed_shape.columns if c not in ['备注', '流水号']]
+df_hemo_first = df_hemo_shape[['流水号'] + hemo_feat_cols].copy()
+df_hemo_first.columns = ['流水号'] + [f'hemo_{col}' for col in hemo_feat_cols]
+df_ed_first = df_ed_shape[['流水号'] + ed_feat_cols].copy()
+df_ed_first.columns = ['流水号'] + [f'ed_{col}' for col in ed_feat_cols]
+
+# 合并基础特征
+df_features = df_clinical.merge(df_first_vol, on='ID', how='left')
+df_features = df_features.merge(df_hemo_first, left_on='入院首次影像检查流水号', right_on='流水号', how='left')
+df_features = df_features.merge(df_ed_first, left_on='入院首次影像检查流水号', right_on='流水号', how='left', suffixes=('', '_ed'))
+df_features.drop(['流水号_x', '流水号_y'], axis=1, inplace=True, errors='ignore')
+
+# ==================== 3. 特征工程（构造新特征） ====================
+print("进行特征工程...")
+df_features['Hemo_ED_ratio'] = df_features['HM_volume'] / (df_features['ED_volume'] + 1e-6)
+hemo_ratio_cols = [c for c in df_features.columns if 'HM_' in c and '_Ratio' in c]
+ed_ratio_cols = [c for c in df_features.columns if 'ED_' in c and '_Ratio' in c]
+df_features['hemo_left_ratio'] = df_features[[c for c in hemo_ratio_cols if 'L' in c]].sum(axis=1)
+df_features['hemo_right_ratio'] = df_features[[c for c in hemo_ratio_cols if 'R' in c]].sum(axis=1)
+df_features['ed_left_ratio'] = df_features[[c for c in ed_ratio_cols if 'L' in c]].sum(axis=1)
+df_features['ed_right_ratio'] = df_features[[c for c in ed_ratio_cols if 'R' in c]].sum(axis=1)
+df_features['hemo_side_diff'] = abs(df_features['hemo_left_ratio'] - df_features['hemo_right_ratio'])
+df_features['ed_side_diff'] = abs(df_features['ed_left_ratio'] - df_features['ed_right_ratio'])
+deep_structures = ['Pons_Medulla', 'Cerebellum']
+for s in deep_structures:
+    hemo_deep_cols = [c for c in hemo_ratio_cols if s in c]
+    ed_deep_cols = [c for c in ed_ratio_cols if s in c]
+    df_features[f'hemo_{s}_total'] = df_features[hemo_deep_cols].sum(axis=1)
+    df_features[f'ed_{s}_total'] = df_features[ed_deep_cols].sum(axis=1)
+gray_cols = [c for c in df_features.columns if 'ed_NCCT_original_firstorder_' in c]
+if len(gray_cols) > 0:
+    df_features['ed_gray_mean'] = df_features[gray_cols].mean(axis=1)
+    df_features['ed_gray_std'] = df_features[gray_cols].std(axis=1)
+shape_cols = [c for c in df_features.columns if 'ed_original_shape_' in c]
+if len(shape_cols) > 0:
+    df_features['ed_shape_mean'] = df_features[shape_cols].mean(axis=1)
+    df_features['ed_shape_std'] = df_features[shape_cols].std(axis=1)
+
+# ==================== 4. 问题1a：判定血肿扩张 ====================
+print("\n正在处理1a：判定所有160例患者的血肿扩张...")
+all_ids = [f'sub{str(i).zfill(3)}' for i in range(1, 161)]
+df_all_clinical = df_clinical[df_clinical['ID'].isin(all_ids)].copy()
+results_1a_all = []
+
+for pid in all_ids:
+    clin_row = df_all_clinical[df_all_clinical['ID'] == pid]
+    if clin_row.empty:
+        results_1a_all.append([pid, None, np.nan, np.nan])
+        continue
+    clin_row = clin_row.iloc[0]
+    first_serial = clin_row['入院首次影像检查流水号']
+    delta_first = clin_row['发病到首次影像检查时间间隔']
+    first_time = time_dict.get(first_serial)
+    if first_time is None:
+        results_1a_all.append([pid, first_serial, np.nan, np.nan])
+        continue
+    vol_row = df_volume[df_volume['ID'] == pid]
+    if vol_row.empty:
+        results_1a_all.append([pid, first_serial, np.nan, np.nan])
+        continue
+    vol_row = vol_row.iloc[0]
+    first_vol = vol_row['HM_volume'] / 1000.0
+    follow_serial_cols = [c for c in df_volume.columns if '随访' in c and '流水号' in c]
+    hemo_cols = [c for c in df_volume.columns if 'HM_volume' in c and c != 'HM_volume']
+    min_len = min(len(follow_serial_cols), len(hemo_cols))
+    follow_serial_cols = follow_serial_cols[:min_len]
+    hemo_cols = hemo_cols[:min_len]
+    expansion_time = None
+    expansion_flag = np.nan
+    has_valid_followup = False
+    for f_col, h_col in zip(follow_serial_cols, hemo_cols):
+        serial = vol_row[f_col]
+        if pd.isna(serial):
+            continue
+        follow_vol = vol_row[h_col] / 1000.0
+        follow_time = time_dict.get(serial)
+        if follow_time is None:
+            continue
+        onset_time = first_time - pd.Timedelta(hours=delta_first)
+        delta = (follow_time - onset_time).total_seconds() / 3600.0
+        if delta <= 48:
+            has_valid_followup = True
+            abs_inc = follow_vol - first_vol
+            rel_inc = abs_inc / first_vol if first_vol > 0 else np.inf
+            if abs_inc >= 6 or rel_inc >= 0.33:
+                expansion_flag = 1
+                expansion_time = delta
+                break
+    if has_valid_followup and pd.isna(expansion_flag):
+        expansion_flag = 0
+    results_1a_all.append([pid, first_serial, expansion_flag, expansion_time])
+
+df_1a_all = pd.DataFrame(results_1a_all, columns=['ID', '首次影像检查流水号', '是否发生血肿扩张', '血肿扩张时间'])
+print("1a完成。有效判定数：", df_1a_all['是否发生血肿扩张'].notna().sum())
+
+# ==================== 5. 准备训练数据（前100例） ====================
+train_ids = [f'sub{str(i).zfill(3)}' for i in range(1, 101)]
+train_df = df_features[df_features['ID'].isin(train_ids)].merge(
+    df_1a_all[['ID', '是否发生血肿扩张']], on='ID', how='left'
+)
+train_df = train_df.dropna(subset=['是否发生血肿扩张'])
+exclude_cols = ['ID', '入院首次影像检查流水号', '是否发生血肿扩张']
+feature_cols = [c for c in train_df.columns if c not in exclude_cols]
+X = train_df[feature_cols]
+y = train_df['是否发生血肿扩张']
+
+print(f"训练集样本数：{len(X)}，正例：{y.sum()}，负例：{len(y)-y.sum()}")
+
+# 预处理：填充缺失值 + 标准化
+imputer = SimpleImputer(strategy='median')
+scaler = StandardScaler()
+X_imp = imputer.fit_transform(X)
+X_scaled = scaler.fit_transform(X_imp)
+
+# ==================== 6. 特征筛选（RFE选择15个特征，防止过拟合） ====================
+print("\n进行递归特征消除（RFE），选择15个特征...")
+rf_est = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42, n_jobs=-1)
+rfe = RFECV(rf_est, step=2, cv=StratifiedKFold(5), scoring='roc_auc', min_features_to_select=15, n_jobs=-1)
+rfe.fit(X_scaled, y)
+selected_features = [feature_cols[i] for i, sel in enumerate(rfe.support_) if sel]
+print(f"RFE选择特征数：{len(selected_features)}")
+if len(selected_features) > 20:
+    rf_temp = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42)
+    rf_temp.fit(X_scaled, y)
+    importances = rf_temp.feature_importances_
+    feat_imp = pd.Series(importances, index=feature_cols).sort_values(ascending=False)
+    selected_features = feat_imp.head(20).index.tolist()
+    print(f"由于RFE选择过多，手动选取前20个重要特征，实际使用{len(selected_features)}个")
+
+# 保留选中特征
+X_selected = X[selected_features]
+X_all_selected = df_features[selected_features]
+
+# 重新预处理（仅对选中特征）
+imputer_sel = SimpleImputer(strategy='median')
+scaler_sel = StandardScaler()
+X_train_sel_imp = imputer_sel.fit_transform(X_selected)
+X_train_sel_scaled = scaler_sel.fit_transform(X_train_sel_imp)
+
+# ==================== 7. 划分训练集和验证集（用于早停） ====================
+X_train, X_val, y_train, y_val = train_test_split(X_train_sel_scaled, y, test_size=0.2, stratify=y, random_state=42)
+print(f"训练集大小：{len(X_train)}，验证集大小：{len(X_val)}")
+
+# ==================== 8. 定义模型并训练（使用class_weight，不使用SMOTE） ====================
+print("\n训练模型（使用class_weight处理不平衡）...")
+model_scores = {}
+models = {}
+
+# 逻辑回归
+lr = LogisticRegression(class_weight='balanced', max_iter=1000, random_state=42)
+lr.fit(X_train, y_train)
+lr_val_pred = lr.predict_proba(X_val)[:, 1]
+lr_val_auc = roc_auc_score(y_val, lr_val_pred)
+model_scores['LogisticRegression'] = lr_val_auc
+models['LogisticRegression'] = lr
+print(f"LogisticRegression 验证集AUC: {lr_val_auc:.4f}")
+
+# 随机森林（加强正则化）
+rf = RandomForestClassifier(n_estimators=100, max_depth=5, min_samples_split=5,
+                            min_samples_leaf=2, class_weight='balanced', random_state=42)
+rf.fit(X_train, y_train)
+rf_val_pred = rf.predict_proba(X_val)[:, 1]
+rf_val_auc = roc_auc_score(y_val, rf_val_pred)
+model_scores['RandomForest'] = rf_val_auc
+models['RandomForest'] = rf
+print(f"RandomForest 验证集AUC: {rf_val_auc:.4f}")
+
+# XGBoost（兼容新旧版本，使用早停）
+if xgb_available:
+    xgb = XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.05,
+                        scale_pos_weight=(y_train == 0).sum() / (y_train == 1).sum(),
+                        random_state=42, use_label_encoder=False, eval_metric='logloss', verbosity=0)
+    try:
+        xgb.fit(X_train, y_train, eval_set=[(X_val, y_val)], early_stopping_rounds=10, verbose=False)
+    except TypeError:
+        try:
+            xgb.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric='logloss', verbose=False,
+                    callbacks=[xgb_callback.EarlyStopping(rounds=10)])
+        except:
+            xgb.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    xgb_val_pred = xgb.predict_proba(X_val)[:, 1]
+    xgb_val_auc = roc_auc_score(y_val, xgb_val_pred)
+    model_scores['XGBoost'] = xgb_val_auc
+    models['XGBoost'] = xgb
+    print(f"XGBoost 验证集AUC: {xgb_val_auc:.4f}")
+
+# LightGBM（使用早停）
+if lgb_available:
+    lgb_model = lgb.LGBMClassifier(n_estimators=100, max_depth=3, learning_rate=0.05,
+                                   class_weight='balanced', random_state=42, verbose=-1)
+    lgb_model.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric='auc',
+                  callbacks=[lgb.early_stopping(10), lgb.log_evaluation(0)])
+    lgb_val_pred = lgb_model.predict_proba(X_val)[:, 1]
+    lgb_val_auc = roc_auc_score(y_val, lgb_val_pred)
+    model_scores['LightGBM'] = lgb_val_auc
+    models['LightGBM'] = lgb_model
+    print(f"LightGBM 验证集AUC: {lgb_val_auc:.4f}")
+
+# 选择验证集AUC最高的模型
+best_model_name = max(model_scores, key=model_scores.get)
+best_model = models[best_model_name]
+best_val_auc = model_scores[best_model_name]
+print(f"\n最佳模型: {best_model_name} (验证集AUC = {best_val_auc:.4f})")
+
+# ==================== 9. 重新训练最佳模型（使用全部训练数据） ====================
+print("\n使用全部训练数据重新训练最佳模型...")
+best_model.fit(X_train_sel_scaled, y)
+
+# ==================== 10. 预测所有患者 ====================
+X_all_imp = imputer_sel.transform(X_all_selected)
+X_all_scaled = scaler_sel.transform(X_all_imp)
+proba_all = best_model.predict_proba(X_all_scaled)[:, 1]
+df_proba_all = pd.DataFrame({
+    'ID': df_features['ID'],
+    '血肿扩张预测概率': proba_all.round(4)
+})
+
+# ==================== 11. 生成答案表 ====================
+print("\n正在生成答案文件...")
+df_id_serial = df_clinical[['ID', '入院首次影像检查流水号']].copy()
+df_id_serial = df_id_serial.rename(columns={'入院首次影像检查流水号': '首次影像检查流水号'})
+df_id_serial['ID'] = df_id_serial['ID'].astype(str)
+
+df_result = df_id_serial.merge(
+    df_1a_all[['ID', '首次影像检查流水号', '是否发生血肿扩张', '血肿扩张时间']],
+    on=['ID', '首次影像检查流水号'],
+    how='left'
+)
+df_result = df_result.merge(df_proba_all[['ID', '血肿扩张预测概率']], on='ID', how='left')
+df_result['残差（全体）'] = np.nan
+df_result['残差（亚组）'] = np.nan
+df_result['所属亚组'] = np.nan
+df_result['预测mRS（基于首次影像）'] = np.nan
+df_result['预测mRS'] = np.nan
+
+desired_order = ['ID', '首次影像检查流水号', '是否发生血肿扩张', '血肿扩张时间', '血肿扩张预测概率',
+                 '残差（全体）', '残差（亚组）', '所属亚组', '预测mRS（基于首次影像）', '预测mRS']
+df_final = df_result[desired_order]
+
+output_file = f'表4-答案文件_泛化版_{best_model_name}_AUC_{best_val_auc:.4f}.xlsx'
+try:
+    df_final.to_excel(output_file, index=False)
+    print(f"已完成！结果已保存至 '{output_file}'")
+except PermissionError:
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_file = f'表4-答案文件_泛化版_{best_model_name}_{timestamp}.xlsx'
+    df_final.to_excel(output_file, index=False)
+    print(f"原文件被占用，结果已保存至 '{output_file}'")
+
+print("\n前10行结果预览：")
+print(df_final[['ID', '是否发生血肿扩张', '血肿扩张时间', '血肿扩张预测概率']].head(10))
+print("\n后10行结果预览（测试集）：")
+print(df_final[['ID', '是否发生血肿扩张', '血肿扩张时间', '血肿扩张预测概率']].tail(10))
+
+# 保存选中的特征
+pd.Series(selected_features).to_csv('selected_features.csv', index=False, header=False)
+print("\n选中的特征已保存至 selected_features.csv")
+
+# ==================== 12. 计算测试集2 AUC（验证泛化能力） ====================
+print("\n计算测试集2 AUC...")
+test2_ids = [f'sub{str(i).zfill(3)}' for i in range(131, 161)]
+test2_df = df_1a_all[df_1a_all['ID'].isin(test2_ids)].copy()
+test2_pred = df_proba_all[df_proba_all['ID'].isin(test2_ids)].copy()
+test2_merged = test2_df.merge(test2_pred, on='ID')
+valid = test2_merged['是否发生血肿扩张'].notna()
+if valid.sum() > 0:
+    test_auc = roc_auc_score(test2_merged.loc[valid, '是否发生血肿扩张'],
+                              test2_merged.loc[valid, '血肿扩张预测概率'])
+    print(f"测试集2 AUC (仅有效样本): {test_auc:.4f}")
+    print(f"有效样本数: {valid.sum()} / {len(test2_merged)}")
+else:
+    print("测试集2中没有有效的真实标签，无法计算AUC。")
+
+# ==================== 13. 可视化部分 ====================
+print("\n生成可视化图表...")
+
+# 创建保存图表的文件夹
+vis_dir = '模型一可视化'
+if not os.path.exists(vis_dir):
+    os.makedirs(vis_dir)
+
+# 13.1 特征重要性条形图（基于随机森林）
+rf_temp = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42)
+rf_temp.fit(X_train_sel_scaled, y)
+importances = rf_temp.feature_importances_
+indices = np.argsort(importances)[::-1][:20]
+plt.figure(figsize=(10, 6))
+plt.barh(range(20), importances[indices][::-1], color='steelblue')
+plt.yticks(range(20), [selected_features[i] for i in indices[::-1]], fontsize=8)
+plt.xlabel('重要性')
+plt.title('前20个特征重要性（随机森林）')
+plt.tight_layout()
+plt.savefig(os.path.join(vis_dir, 'feature_importance.png'), dpi=300)
+plt.close()
+print("特征重要性图已保存至", os.path.join(vis_dir, 'feature_importance.png'))
+
+# 13.2 模型验证集AUC对比柱状图
+model_names = list(model_scores.keys())
+auc_values = list(model_scores.values())
+plt.figure(figsize=(8, 5))
+bars = plt.bar(model_names, auc_values, color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd'][:len(model_names)])
+plt.ylim(0, 1)
+plt.ylabel('AUC')
+plt.title('各模型验证集AUC对比')
+for bar, auc_val in zip(bars, auc_values):
+    plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+             f'{auc_val:.3f}', ha='center', va='bottom', fontsize=10)
+plt.tight_layout()
+plt.savefig(os.path.join(vis_dir, 'model_comparison.png'), dpi=300)
+plt.close()
+print("模型对比图已保存至", os.path.join(vis_dir, 'model_comparison.png'))
+
+# 13.3 最佳模型（逻辑回归）的ROC曲线（训练集5折交叉验证平均ROC + 测试集2 ROC）
+# 计算训练集5折交叉验证的ROC曲线
+cv = StratifiedKFold(5)
+tprs = []
+aucs = []
+mean_fpr = np.linspace(0, 1, 100)
+plt.figure(figsize=(8, 6))
+for i, (train_idx, val_idx) in enumerate(cv.split(X_train_sel_scaled, y)):
+    model = LogisticRegression(class_weight='balanced', max_iter=1000, random_state=42)
+    model.fit(X_train_sel_scaled[train_idx], y.iloc[train_idx])
+    y_pred = model.predict_proba(X_train_sel_scaled[val_idx])[:, 1]
+    fpr, tpr, _ = roc_curve(y.iloc[val_idx], y_pred)
+    auc_val = auc(fpr, tpr)
+    aucs.append(auc_val)
+    interp_tpr = np.interp(mean_fpr, fpr, tpr)
+    interp_tpr[0] = 0.0
+    tprs.append(interp_tpr)
+    plt.plot(fpr, tpr, lw=1, alpha=0.3, label=f'Fold {i+1} (AUC={auc_val:.3f})')
+mean_tpr = np.mean(tprs, axis=0)
+mean_tpr[-1] = 1.0
+mean_auc = auc(mean_fpr, mean_tpr)
+plt.plot(mean_fpr, mean_tpr, color='b', label=f'Mean ROC (AUC={mean_auc:.3f})', lw=2)
+# 测试集2 ROC
+if valid.sum() > 0:
+    fpr_test, tpr_test, _ = roc_curve(test2_merged.loc[valid, '是否发生血肿扩张'],
+                                      test2_merged.loc[valid, '血肿扩张预测概率'])
+    test_auc_val = auc(fpr_test, tpr_test)
+    plt.plot(fpr_test, tpr_test, color='r', lw=2, label=f'Test Set 2 (AUC={test_auc_val:.3f})')
+plt.plot([0, 1], [0, 1], 'k--', lw=1)
+plt.xlim([0, 1])
+plt.ylim([0, 1])
+plt.xlabel('假阳性率')
+plt.ylabel('真阳性率')
+plt.title('最佳模型（逻辑回归）ROC曲线')
+plt.legend(loc='lower right')
+plt.tight_layout()
+plt.savefig(os.path.join(vis_dir, 'roc_curve.png'), dpi=300)
+plt.close()
+print("ROC曲线图已保存至", os.path.join(vis_dir, 'roc_curve.png'))
+
+# 13.4 预测概率分布直方图（区分扩张与非扩张）
+# 使用训练集的真实标签和预测概率
+train_pred_proba = best_model.predict_proba(X_train_sel_scaled)[:, 1]
+plt.figure(figsize=(8, 5))
+plt.hist(train_pred_proba[y == 1], bins=15, alpha=0.6, label='扩张组', color='red', edgecolor='black')
+plt.hist(train_pred_proba[y == 0], bins=15, alpha=0.6, label='非扩张组', color='blue', edgecolor='black')
+plt.xlabel('预测概率')
+plt.ylabel('频数')
+plt.title('训练集预测概率分布（逻辑回归）')
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(vis_dir, 'probability_distribution.png'), dpi=300)
+plt.close()
+print("概率分布图已保存至", os.path.join(vis_dir, 'probability_distribution.png'))
+
+print("\n所有可视化图表生成完毕！")  
